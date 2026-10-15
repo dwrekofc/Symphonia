@@ -287,6 +287,13 @@ fn read_id3v2_body<B: ReadBytes + FiniteStream>(
         trace!("{:#?}", &extended);
     }
 
+    // Compatibility with newer readers: tolerate a declared empty tag body.
+    // This is not ID3 conformance (a tag should contain a frame). Keep all
+    // nonempty-body and extended-header errors unchanged.
+    if header.size == 0 {
+        return Ok(());
+    }
+
     let min_frame_size = match header.major_version {
         2 => 6,
         3 | 4 => 10,
@@ -420,3 +427,6 @@ impl MetadataReader for Id3v2Reader {
         Ok(builder.metadata())
     }
 }
+
+#[cfg(test)]
+mod empty_tag_tests;
