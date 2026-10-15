@@ -45,6 +45,8 @@ pub struct MpaReader<'s> {
     metadata: MetadataLog,
     first_packet_pos: u64,
     next_packet_ts: Timestamp,
+    // Estimated durations are useful for coarse seeking, not exact tail trimming.
+    n_frames_is_estimated: bool,
 }
 
 impl Scoreable for MpaReader<'_> {
@@ -206,10 +208,15 @@ impl FormatReader for MpaReader<'_> {
             .pts(pts)
             .trimmed_dur(
                 dur,
-                self.tracks[0]
-                    .num_frames
-                    .map(Duration::from)
-                    .and_then(|dur| dur.timestamp_from(Timestamp::ZERO)),
+                if self.n_frames_is_estimated {
+                    None
+                }
+                else {
+                    self.tracks[0]
+                        .num_frames
+                        .map(Duration::from)
+                        .and_then(|dur| dur.timestamp_from(Timestamp::ZERO))
+                },
             )
             .data(data)
             .build();
@@ -425,6 +432,7 @@ impl<'s> MpaReader<'s> {
 
         // Create the track.
         let mut track = Track::new(0);
+        let mut n_frames_is_estimated = false;
 
         track.with_codec_params(CodecParameters::Audio(codec_params));
 
@@ -467,6 +475,7 @@ impl<'s> MpaReader<'s> {
 
                 if let Some(n_mpeg_frames) = estimate_num_mpeg_frames(&mut mss) {
                     track.with_num_frames(n_mpeg_frames * u64::from(header.num_frames()));
+                    n_frames_is_estimated = true;
                 }
             }
         }
@@ -487,6 +496,7 @@ impl<'s> MpaReader<'s> {
             metadata: opts.external_data.metadata.unwrap_or_default(),
             first_packet_pos,
             next_packet_ts,
+            n_frames_is_estimated,
         })
     }
 
@@ -1110,3 +1120,6 @@ mod tests {
         assert!(is_maybe_vbri_tag(&buf, &header));
     }
 }
+
+#[cfg(test)]
+mod duration_tests;
