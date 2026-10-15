@@ -33,6 +33,8 @@ pub struct MpaReader {
     options: FormatOptions,
     first_packet_pos: u64,
     next_packet_ts: u64,
+    // Estimated durations are useful for coarse seeking, not exact tail trimming.
+    n_frames_is_estimated: bool,
 }
 
 impl QueryDescriptor for MpaReader {
@@ -98,6 +100,7 @@ impl FormatReader for MpaReader {
 
         // Use the header to populate the codec parameters.
         let mut params = CodecParameters::new();
+        let mut n_frames_is_estimated = false;
 
         params
             .for_codec(header.codec())
@@ -151,6 +154,7 @@ impl FormatReader for MpaReader {
 
                 if let Some(n_mpeg_frames) = estimate_num_mpeg_frames(&mut source) {
                     params.with_n_frames(n_mpeg_frames * header.duration());
+                    n_frames_is_estimated = true;
                 }
             }
         }
@@ -165,6 +169,7 @@ impl FormatReader for MpaReader {
             options: *options,
             first_packet_pos,
             next_packet_ts: 0,
+            n_frames_is_estimated,
         })
     }
 
@@ -204,7 +209,12 @@ impl FormatReader for MpaReader {
             symphonia_core::formats::util::trim_packet(
                 &mut packet,
                 self.tracks[0].codec_params.delay.unwrap_or(0),
-                self.tracks[0].codec_params.n_frames,
+                if self.n_frames_is_estimated {
+                    None
+                }
+                else {
+                    self.tracks[0].codec_params.n_frames
+                },
             );
         }
 
@@ -921,3 +931,6 @@ fn is_maybe_vbri_tag(buf: &[u8], header: &FrameHeader) -> bool {
     // The bytes preceeding the VBRI tag (mostly the side information) should be all 0.
     !buf[MPEG_HEADER_LEN..VBRI_TAG_OFFSET].iter().any(|&b| b != 0)
 }
+
+#[cfg(test)]
+mod duration_tests;

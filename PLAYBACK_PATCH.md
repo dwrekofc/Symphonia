@@ -21,3 +21,17 @@ the same exact Git revision. This preserves one shared core type identity for
 all 0.5 codecs. The 0.6 branch is not replaced. The metadata/core tests can run
 from an exact two-member copied workspace when optional upstream player/check
 workspace tool dependencies are unavailable offline; source/manifests stay exact.
+
+## Untagged MPEG duration estimates
+
+The MPEG 0.5.5 demuxer estimates duration from initial frame sizes when no
+Xing/Info/VBRI duration exists, then incorrectly applies that estimate as an
+exact gapless tail boundary. Variable bitrate streams can lose substantial
+audio. A private flag now distinguishes this estimate from declared counts.
+The estimate remains available for coarse seeking/duration; only its use as a
+packet trim boundary is removed. Declared counts, encoder delay/padding,
+metadata, all codecs and DSP stay unchanged. New reader tests cover MPEG1/2/2.5
+underestimates, exact/overestimates, declared Xing/Info/VBRI limits, encoder
+delay/padding, missing counts, short and truncated streams. Consumers also patch
+symphonia-bundle-mp3 0.5.5 to this same Git identity. This change does not claim
+that the independent 0.6 exporter reader has identical duration behavior.
