@@ -412,6 +412,10 @@ impl AacDecoder {
             _ => return unsupported_error("aac: object type"),
         }
 
+        // AAC-LC subset of upstream PR #473. In 0.5, the format reader's
+        // enable_gapless option controls whether packet trims are present.
+        self.buf.trim(packet.trim_start() as usize, packet.trim_end() as usize);
+
         Ok(())
     }
 }

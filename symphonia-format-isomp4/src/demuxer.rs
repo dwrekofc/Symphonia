@@ -7,19 +7,22 @@
 
 use symphonia_core::{errors::end_of_stream_error, support_format};
 
-use symphonia_core::codecs::CodecParameters;
+use symphonia_core::codecs::{CodecParameters, CODEC_TYPE_AAC};
 use symphonia_core::errors::{
     decode_error, seek_error, unsupported_error, Error, Result, SeekErrorKind,
 };
 use symphonia_core::formats::prelude::*;
+use symphonia_core::formats::util::trim_packet;
 use symphonia_core::io::{MediaSource, MediaSourceStream, ReadBytes, SeekBuffered};
 use symphonia_core::meta::{Metadata, MetadataLog};
 use symphonia_core::probe::{Descriptor, Instantiate, QueryDescriptor};
 use symphonia_core::units::Time;
 
+use std::convert::TryFrom;
 use std::io::{Seek, SeekFrom};
 use std::sync::Arc;
 
+use crate::atoms::elst::ElstEntry;
 use crate::atoms::{AtomIterator, AtomType};
 use crate::atoms::{FtypAtom, MetaAtom, MoofAtom, MoovAtom, MvexAtom, SidxAtom, TrakAtom};
 use crate::stream::*;
@@ -36,11 +39,14 @@ pub struct TrackState {
     next_sample: u32,
     /// The current sample byte position relative to the start of the track.
     next_sample_pos: u64,
+    /// Presentation edit in the existing 0.5 packet trim domain.
+    edit: EditListTiming,
+    aac_block_dur: Option<u64>,
 }
 
 impl TrackState {
     #[allow(clippy::single_match)]
-    pub fn new(track_num: usize, trak: &TrakAtom) -> Self {
+    pub fn new(track_num: usize, trak: &TrakAtom, movie_timescale: u32, gapless: bool) -> Self {
         let mut codec_params = CodecParameters::new();
 
         codec_params
@@ -50,12 +56,87 @@ impl TrackState {
         // Fill the codec parameters using the sample description atom.
         trak.mdia.minf.stbl.stsd.fill_codec_params(&mut codec_params);
 
-        Self { codec_params, track_num, cur_seg: 0, next_sample: 0, next_sample_pos: 0 }
+        let edit = if gapless {
+            trak.edts
+                .as_ref()
+                .and_then(|e| e.elst.as_ref())
+                .and_then(|e| {
+                    edit_list_timing(&e.entries, movie_timescale, trak.mdia.mdhd.timescale)
+                })
+                .unwrap_or_default()
+        } else {
+            EditListTiming::default()
+        };
+        if edit.delay > 0 {
+            codec_params.with_delay(edit.delay);
+        }
+        if let Some(duration) = edit.duration {
+            codec_params.with_n_frames(duration);
+        }
+
+        // The pinned 0.5 AAC decoder accepts only LC, without SBR, with exactly
+        // 1024 decoded frames per access unit (aac/mod.rs::try_new). Limit this
+        // adapter to the matching media/sample clock; unsupported profiles still
+        // fail in that unchanged decoder admission check.
+        let aac_block_dur = if gapless
+            && codec_params.codec == CODEC_TYPE_AAC
+            && codec_params.sample_rate == Some(trak.mdia.mdhd.timescale)
+        {
+            Some(1024)
+        } else {
+            None
+        };
+        Self {
+            codec_params,
+            track_num,
+            cur_seg: 0,
+            next_sample: 0,
+            next_sample_pos: 0,
+            edit,
+            aac_block_dur,
+        }
     }
 
     pub fn codec_params(&self) -> CodecParameters {
         self.codec_params.clone()
     }
+}
+
+// Backport of upstream PR #574 single normal-rate edit mapping. The 0.5
+// trim_packet API uses u32 delay; edits outside that domain stay unsupported.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct EditListTiming {
+    delay: u32,
+    duration: Option<u64>,
+}
+fn edit_list_timing(
+    entries: &[ElstEntry],
+    movie_scale: u32,
+    media_scale: u32,
+) -> Option<EditListTiming> {
+    let [entry] = entries else {
+        return None;
+    };
+    if entry.media_time < 0
+        || entry.media_rate_int != 1
+        || entry.media_rate_frac != 0
+        || movie_scale == 0
+        || media_scale == 0
+    {
+        return None;
+    }
+    let delay = u32::try_from(entry.media_time).ok()?;
+    let duration = match entry.segment_duration {
+        0 => None,
+        duration => Some(
+            u64::try_from(
+                (u128::from(duration) * u128::from(media_scale) + u128::from(movie_scale) / 2)
+                    / u128::from(movie_scale),
+            )
+            .ok()?,
+        ),
+    };
+    Some(EditListTiming { delay, duration })
 }
 
 /// Information regarding the next sample.
@@ -244,6 +325,14 @@ impl IsoMp4Reader {
 
     fn seek_track_by_ts(&mut self, track_num: usize, ts: u64) -> Result<SeekedTo> {
         debug!("seeking track={} to frame_ts={}", track_num, ts);
+        let delay = u64::from(
+            self.track_states
+                .get(track_num)
+                .ok_or(Error::SeekError(SeekErrorKind::Unseekable))?
+                .edit
+                .delay,
+        );
+        let media_ts = ts.checked_add(delay).ok_or(Error::SeekError(SeekErrorKind::OutOfRange))?;
 
         struct SeekLocation {
             seg_idx: usize,
@@ -257,7 +346,7 @@ impl IsoMp4Reader {
             // Iterate over all segments and attempt to find the segment and sample number that
             // contains the desired timestamp. Skip segments already examined.
             for (seg_idx, seg) in self.segs.iter().enumerate().skip(seg_skip) {
-                if let Some(sample_num) = seg.ts_sample(track_num, ts)? {
+                if let Some(sample_num) = seg.ts_sample(track_num, media_ts)? {
                     seek_loc = Some(SeekLocation { seg_idx, sample_num });
                     break;
                 }
@@ -298,9 +387,12 @@ impl IsoMp4Reader {
                 timing.ts as i64 - ts as i64
             );
 
-            Ok(SeekedTo { track_id: track_num as u32, required_ts: ts, actual_ts: timing.ts })
-        }
-        else {
+            Ok(SeekedTo {
+                track_id: track_num as u32,
+                required_ts: ts,
+                actual_ts: timing.ts.saturating_sub(delay),
+            })
+        } else {
             // Timestamp was not found.
             seek_error(SeekErrorKind::OutOfRange)
         }
@@ -324,7 +416,7 @@ impl QueryDescriptor for IsoMp4Reader {
 }
 
 impl FormatReader for IsoMp4Reader {
-    fn try_new(mut mss: MediaSourceStream, _options: &FormatOptions) -> Result<Self> {
+    fn try_new(mut mss: MediaSourceStream, options: &FormatOptions) -> Result<Self> {
         // To get to beginning of the atom.
         mss.seek_buffered_rel(-4);
 
@@ -461,7 +553,7 @@ impl FormatReader for IsoMp4Reader {
             .traks
             .iter()
             .enumerate()
-            .map(|(t, trak)| TrackState::new(t, trak))
+            .map(|(t, trak)| TrackState::new(t, trak, moov.mvhd.timescale, options.enable_gapless))
             .collect::<Vec<TrackState>>();
 
         // Instantiate a Tracks for all tracks above.
@@ -533,12 +625,26 @@ impl FormatReader for IsoMp4Reader {
             }
         }
 
-        Ok(Packet::new_from_boxed_slice(
+        let state = &self.track_states[next_sample_info.track_num];
+        let edit = state.edit;
+        let duration = if state.aac_block_dur.is_some() {
+            let end = next_sample_info
+                .ts
+                .checked_add(u64::from(next_sample_info.dur))
+                .ok_or(Error::DecodeError("isomp4: AAC presentation timestamp overflow"))?
+                .saturating_sub(u64::from(edit.delay));
+            Some(edit.duration.map_or(end, |track_end| end.min(track_end)))
+        } else {
+            edit.duration
+        };
+        let mut packet = Packet::new_from_boxed_slice(
             next_sample_info.track_num as u32,
             next_sample_info.ts,
-            u64::from(next_sample_info.dur),
+            state.aac_block_dur.unwrap_or(u64::from(next_sample_info.dur)),
             reader.read_boxed_slice_exact(sample_info.len as usize)?,
-        ))
+        );
+        trim_packet(&mut packet, edit.delay, duration);
+        Ok(packet)
     }
 
     fn metadata(&mut self) -> Metadata<'_> {
@@ -602,5 +708,60 @@ impl FormatReader for IsoMp4Reader {
 
     fn into_inner(self: Box<Self>) -> MediaSourceStream {
         self.iter.into_inner()
+    }
+}
+
+#[cfg(test)]
+mod edit_tests {
+    use super::*;
+    fn entry(duration: u64, delay: i64) -> ElstEntry {
+        ElstEntry {
+            segment_duration: duration,
+            media_time: delay,
+            media_rate_int: 1,
+            media_rate_frac: 0,
+        }
+    }
+    #[test]
+    fn single_edit_rescales_and_retains_delay() {
+        assert_eq!(
+            edit_list_timing(&[entry(3000, 1024)], 1000, 44100),
+            Some(EditListTiming { delay: 1024, duration: Some(132300) })
+        );
+        assert_eq!(
+            edit_list_timing(&[entry(5, 1024)], 1000, 44100),
+            Some(EditListTiming { delay: 1024, duration: Some(221) })
+        );
+        assert_eq!(
+            edit_list_timing(&[entry(0, 1024)], 1000, 48000),
+            Some(EditListTiming { delay: 1024, duration: None })
+        );
+    }
+    #[test]
+    fn unsupported_edits_and_overflow_leave_legacy_timeline() {
+        assert_eq!(edit_list_timing(&[], 1000, 48000), None);
+        assert_eq!(edit_list_timing(&[entry(3000, 0), entry(3000, 1024)], 1000, 48000), None);
+        assert_eq!(edit_list_timing(&[entry(3000, -1)], 1000, 48000), None);
+        assert_eq!(edit_list_timing(&[entry(3000, i64::MAX)], 1000, 48000), None);
+        assert_eq!(edit_list_timing(&[entry(u64::MAX, 0)], 1, u32::MAX), None);
+        assert_eq!(edit_list_timing(&[entry(3000, 1024)], 0, 48000), None);
+        let mut e = entry(3000, 1024);
+        e.media_rate_int = 0;
+        assert_eq!(edit_list_timing(&[e], 1000, 48000), None);
+    }
+    #[test]
+    fn existing_packet_trim_preserves_block_and_presentation_lengths() {
+        let mut first = Packet::new_from_slice(0, 0, 1024, &[0]);
+        trim_packet(&mut first, 1024, Some(24000));
+        assert_eq!(
+            (first.ts(), first.dur(), first.trim_start(), first.trim_end()),
+            (0, 0, 1024, 0)
+        );
+        let mut last = Packet::new_from_slice(0, 24576, 1024, &[0]);
+        trim_packet(&mut last, 1024, Some(24000));
+        assert_eq!(
+            (last.ts(), last.dur(), last.trim_start(), last.trim_end()),
+            (23552, 448, 0, 576)
+        );
     }
 }
