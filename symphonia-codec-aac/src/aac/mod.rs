@@ -47,10 +47,11 @@ pub struct AacDecoder {
     sbinfo: GASubbandInfo,
     params: AudioCodecParameters,
     buf: AudioBuffer<f32>,
+    gapless: bool,
 }
 
 impl AacDecoder {
-    pub fn try_new(params: &AudioCodecParameters, _opts: &AudioDecoderOptions) -> Result<Self> {
+    pub fn try_new(params: &AudioCodecParameters, opts: &AudioDecoderOptions) -> Result<Self> {
         // This decoder only supports AAC.
         if params.codec != CODEC_ID_AAC {
             return unsupported_error("aac: invalid codec");
@@ -105,7 +106,15 @@ impl AacDecoder {
 
         let buf = AudioBuffer::new(AudioSpec::new(asc.sample_rate, channels), asc.samples);
 
-        Ok(AacDecoder { asc, pairs: Vec::new(), dsp: dsp::Dsp::new(), sbinfo, params, buf })
+        Ok(AacDecoder {
+            asc,
+            pairs: Vec::new(),
+            dsp: dsp::Dsp::new(),
+            sbinfo,
+            params,
+            buf,
+            gapless: opts.gapless,
+        })
     }
 
     fn set_pair(&mut self, pair_no: usize, channel: usize, pair: bool) -> Result<()> {
@@ -239,6 +248,15 @@ impl AacDecoder {
         match self.asc.object_type {
             AudioObjectType::Lc => self.decode_ga(&mut bs)?,
             _ => return unsupported_error("aac: object type"),
+        }
+
+        // Apply packet presentation trims after decoding so the overlap state is retained.
+        // AAC-LC subset of upstream PR #473 (00043533d7ed02d679d71cfb7efcb3b76e83ed38).
+        if self.gapless {
+            self.buf.trim(
+                usize::try_from(packet.trim_start.get()).unwrap_or(usize::MAX),
+                usize::try_from(packet.trim_end.get()).unwrap_or(usize::MAX),
+            );
         }
 
         Ok(())
