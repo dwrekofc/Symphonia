@@ -17,6 +17,9 @@ mod atoms;
 mod demuxer;
 mod fourcc;
 mod fp;
+mod inspection;
 mod stream;
 
 pub use demuxer::IsoMp4Reader;
+
+pub use inspection::{EditInfo, Inspection, MovieInfo, TrackInfo};
